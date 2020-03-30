@@ -1,0 +1,142 @@
+The CBC Padding Oracle Problem
+
+Feb 9, 2019
+
+I recently started working on the cryptopals crypto challanges for fun, and to learn more about modern cryptography. I just finished a very fun and challenging problem: set 3 challenge 17, in which you need to implement a padding oracle attack against AES-128-CBC.
+
+One of my goals with the cryptopals challenges is to solve as many of them as possible without looking at any hints (or other people’s solutions). This one was kind of tricky, but I was able to come up with a kind of convoluted solution eventually. After going over my code and simplifying things with the insights a gained later in the solution, I ended up arriving at the “correct” algorithm that matches the canonical description of the attack. This is something I wouldn’t have gotten immediately: I only arrived at an elegant solution after taking some wrong turns and retracing my steps. In this post I’m going to talk about how I actually solved the problem from the beginning, and then how I was able to rework that code to a simpler solution.
+
+CBC Padding Oracles
+
+In challenge 17 you implement a system where an attacker is given an encrypted string, and the initialization vector (IV) used to encrypt the string. The attacker also has access to an oracle function. The oracle function works like this: you give the oracle function some ciphertext, and it decrypts the ciphertext and validates the PKCS#7 padding on the decrypted text. The oracle returns a boolean indicating whether the padding was valid or not.
+
+This situation is similar to how AES might be used by a web server. For example, imagine that a web server encrypts cookie values before sending them to browsers. When the web server subsequently receives an HTTP request with cookies from a browser, it will need to decrypt the cookies to process them. That decryption logic will typically remove any PKCS#7 padding after validating it. If invalid padding causes the server to send an error response back to the browser, then the browser effectively has access to a “padding oracle” just like the one in the problem statement.
+
+Using only the oracle function (and the IV), it turns out that the attacker can decrypt the encrypted string! The attack can be mitigated if the server uses a secure IV, but it’s common in the real world for code to use a well known default IV value, e.g. all zeros.
+
+Background: CBC Bit Flipping
+
+In the previous challenge you learn about an interesting property that CBC mode has: after introducing a 1-bit error in a ciphertext block, decrypting the ciphertext will propagate the identical 1-bit error in the next block (and completely scramble the block the error occurred in). That description is a bit abstract, but it’s easy to illustrate with an example. To use CBC the data to be encrypted is first split into regular sized blocks, which are 16 bytes (128 bits) in the case of AES-128. Let’s say you’re given some ciphertext, and you don’t know the encryption key (or IV) that was used to encrypt the data. If you flip the bit N in block X of the ciphertext, decrypting this corrupted ciphertext will cause block X+1 to decrypt without any errors except that bit N in that block will be flipped.
+
+For example, let’s say in the ciphertext the 7th bit in block #4 was a 0, and you flip it to 1. If you provide this corrupted ciphertext back to someone with the original key and the decrypt it, they’ll observe block #5 in the plaintext to be identical to how it was before except that the 7th bit will have flipped! This property lets you flip bits without knowing what they actually are.
+
+This is definitely not an obvious property, but there’s a simple mathematical explanation, which has to do with how different terms cancel out when doing XOR operations in CBC mode.
+
+First Step: Detecting The Padding Byte
+
+The problem description contains a hint that it’s possible to detect what value was used as the PKCS#7 padding byte. Using the CBC bit flipping property, I knew it would be possible to flip any arbitrary bit in the final ciphertext block, which is the block that contains the PKCS#7 padding.
+
+I started by asking myself the question: How could I detect if there is only one padding byte? In this case the padding byte itself will be a 1, so the block will be something like:
+
+* * * * * * * * * * * * * * * 1
+
+Here’s what it would look like with 2 padding bytes:
+
+* * * * * * * * * * * * * * 2 2
+
+And with three:
+
+* * * * * * * * * * * * * 3 3 3
+
+And so on, all the way up to 16 padding bytes (the max). After thinking about this for a while, I realized something interesting. Mutating the second-to-last byte won’t invalidate the padding when there’s only 1 padding byte. If we denote the changed byte with @, corrupting the second-to-last byte will make the block look like:
+
+* * * * * * * * * * * * * * @ *
+
+If the padding byte is 1 then the block will still have valid padding after this mutation. But if there were 2, 3, or more padding bytes, then the change will have corrupted the block padding. Very interesting; using this, I could detect if the last byte was a 1!
+
+I quickly realized that this property is inductive. If the padding byte is a 2, then this means that mutating the second-to-last byte (as before) will produce invalid padding; but mutating the third-to-last byte will not produce invalid padding.
+
+In general, can you start from the right and work towards the left, checking each byte one a time. The number of test bytes you mutate before the oracle tells you that the padding is valid tells you how many padding bytes there were, and what the value was in each of those bytes.
+
+Decrypting The Remaining Bytes In The Padding Block
+
+Let’s say the final block has 13 padding bytes (an example I use because the first example in the problem requires this many). At this point we’ve determined that the last block has the following structure:
+
+A B C 13 13 13 13 13 13 13 13 13 13 13 13 13
+
+The question is: how do we solve for A, B, and C? Here’s the idea I came up with. We flip bits in the padding bytes to set them all to the next highest number, in this case 14. The code to do this is pretty simple: you just compare 13 and 14 bit by bit and determine which bits are different, then you create a mask with those bits set. That mask can be applied using xor to convert 13 to 14. The code looks like this:
+
+// Generate a mask that can be applied using xor to convert x to y.
+
+func generateCopyMask(x, y byte) byte {
+
+	var finalMask byte	var i uint
+
+	for i = 0; i < 8; i++ {
+
+		mask := byte(1 << i)
+
+		if (x & mask) != (y & mask) {
+
+			finalMask |= mask
+
+		}
+
+	}
+
+	return finalMask
+
+}
+
+Applying this mask to each of the 13 padding bytes creates the following structure:
+
+A B C 14 14 14 14 14 14 14 14 14 14 14 14 14
+
+If the oracle says that this block does not have valid padding, then we know that C must be some value other than 14. We don’t know what the value of C is, but we do know that there must be some bit mask M that can be applied to C such that C^M = 14 (here ^ indicates xor). Since C is just one byte, the mask M will also be one byte. That means there’s only 256 possible mask values, the values ranging from 0 to 255.
+
+The way to find C then is to try all 256 of these mask values until we find the value of M that causes the oracle to say “valid padding”. Since xor is a reversible operation, we can then solve for C as: C = 14^M. Thus we’ve decrypted one byte from the original plaintext string!
+
+We can keep proceeding byte by byte to finish decrypting the whole block: set all the bytes to 15 to produce:
+
+A B 15 15 15 15 15 15 15 15 15 15 15 15 15 15
+
+And then continue as before to solve for B and then A. At this point in the puzzle you’ll have decrypted a few bytes from the original message (unless the message happened to require a full 16 byte padding block).
+
+Decrypting The Middle Blocks
+
+To fully solve the problem you need to decrypt the other blocks as well. By the time I got to this point in the puzzle I had a pretty good intuition for transforming blocks using bit flips. The solution for the block we just solved had a kind of inductive approach, where we figured out the padding bytes, and then used knowledge of the contents of byte N to decrypt byte N-1. This immediately made me wonder: can we solve other blocks by going one step deeper in the induction, i.e. using zero padding bytes?
+
+The next block in the puzzle has 16 unknown bytes, we we’ll denote them all with letters:
+
+A B C D E F G H I J K L M N O P
+
+If we assume there are zero padding bytes, then the next step in the induction is to set the last byte P to 1. This works because 1 is always a valid final padding byte. When we do this the line becomes:
+
+A B C D E F G H I J K L M N O 1
+
+Doing this is the same as before: there are 256 masks we can try applying to P, so we just try them all until the oracle says “valid padding”. Once we’ve done this we know that P=1^M. Then we can solve the rest of the bytes as before.
+
+Decrypting The First Block
+
+There’s a small problem when decrypting the first block of ciphertext (which is the last block that will be solved, since we need to work backwards). To flip a bit in block X we need to actually apply the bit flip to block X-1 in the ciphertext. When we get to the first block, we need to apply the changes to the zeroth block, except there is no zeroth block.
+
+Actually, there is a zeroth block: the IV block. The IV acts as a preceeding block for the first block of plaintext during encryption. Therefore to decrypt the first block of ciphertext (which again, will be the last block we decrypt) we have to make bit changes against the IV. This is a lot simpler if you prepend the IV to the ciphertext before solving blocks, as this approach makes it so that there’s no special case needed when you get to the first block.
+
+Generalizing And Simplifying
+
+At this point I was done with the puzzle and had working code that could decrypt all of the test inputs. However, I also realized that because I had written code to decipher arbitrary blocks, there was no real reason to treat the padding block any differently from other blocks. You can actually treat the last block as a black box, and solve it the same way as any other block by first figuring out how to force the last byte to be 1, and then continuing on to the remaining bytes. This makes the code a lot simpler, since you can treat all blocks identically.
+
+While refactoring my code to introduce this change I found a bug in my logic, which happened not to be tested by the cryptopals test strings. Consider the case for an arbitrary block as before:
+
+A B C D E F G H I J K L M N O P
+
+There’s some mask value that can be applied to P that will cause the oracle to say “valid padding”. Previously we assumed that this meant the mask set P to 1, but this isn’t necessarily the case. Consider the pathological case where the second-to-last byte O happens to be 2, so the block is actually like:
+
+A B C D E F G H I J K L M N 2 P
+
+When we’re generating masks and solving for P, there’s one mask value that turns P into 1, and another mask value that turns P into 2. Both of these masks will cause the oracle to say “valid padding”. You can generalize this to other cases like:
+
+A B C D E F G H I J K L M 3 3 P
+
+In this case there’s a mask value that sets P to 1 which is a valid padding, and another mask value that sets P to 3, which is also a valid padding.
+
+The cryptopals test strings are all ASCII data in the plaintext, which means they don’t have these low value bytes in them. But treating the padding block like the other blocks causes you to immediately run into this problem, because the padding block always has this pathological property.
+
+Working around this problem is actually quite easy though. Once you find the mask that you think sets P to 1, you can verify that P is actually 1 by flipping a bit in O. If the oracle still says “valid padding” after the bit flip in O then you know that P is actually 1. If not you simply keep trying more mask values. This is only required when solving the first byte (which is in the last position) of each block.
+
+You can find the full code I wrote for my solution here.
+
+HomeEmailPGPRSSGitHub
+
+
+https://eklitzke.org/the-cbc-padding-oracle-problem
